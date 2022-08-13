@@ -1,0 +1,7 @@
+numpy
+torch
+transformers
+soundfile
+resampy
+dearpygui
+pyaudio
