@@ -1,6 +1,7 @@
 # live speech recognition
 
 This is a simple live ASR application example, with a simple GUI.
+
 We use [transformers](https://huggingface.co/models) for the ASR models.
 
 A sliding window is used to split the infinite audio input:
@@ -31,7 +32,9 @@ python asr.py --wav aud.wav # transcribe a local wav file.
 
 python asr.py --model ydshieh/wav2vec2-large-xlsr-53-chinese-zh-cn-gpt # change the ASR model
 
-# adjust the sliding window
+# adjust the sliding window (left - middle - right)
+# by default the audio is at 50 FPS (20ms per frame), so the latency will be (m + r) * 20ms
+# a larger window generally leads to better recoginition performance, at the cost of a longer latency.
 python asr.py -l 20 -m 60 -r 20
 
 ```
