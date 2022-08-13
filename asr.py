@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import torch
 from transformers import AutoModelForCTC, AutoProcessor
@@ -78,8 +79,7 @@ class ASRGUI:
         # discard the old part
         self.frames = self.frames[-(self.stride_left_size + self.stride_right_size):]
 
-        starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        starter.record()
+        t0 = time.time()
 
         text = self.frame_to_text(inputs)
 
@@ -87,12 +87,13 @@ class ASRGUI:
         if text != '':
             self.text = self.text + ' ' + text
         
-        ender.record()
-        torch.cuda.synchronize()
-        t = starter.elapsed_time(ender)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        t = time.time() - t0
 
         dpg.set_value("_log_text", self.text)
-        dpg.set_value("_log_infer_time", f'{t:.4f}ms ({int(1000/t)} FPS)')
+        dpg.set_value("_log_infer_time", f'{1000 * t:.4f}ms ({int(1/t)} FPS)')
 
     
     def create_file_stream(self):
