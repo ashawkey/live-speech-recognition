@@ -1,6 +1,7 @@
 import time
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCTC, AutoProcessor
 
 import soundfile as sf
@@ -24,11 +25,15 @@ class ASRGUI:
         self.context_size = opt.m
         self.stride_left_size = opt.l
         self.stride_right_size = opt.r
-        self.frames = []
         self.text = '[START]\n'
+        self.terminated = False
+        self.frames = []
 
-        # create input device
-        
+        # pad left frames
+        if self.stride_left_size > 0:
+            self.frames.extend([np.zeros(self.chunk, dtype=np.float32)] * self.stride_left_size)
+
+        # create input stream
         if self.mode == 'file':
             self.stream = self.create_file_stream()
         else:
@@ -41,6 +46,10 @@ class ASRGUI:
         print(f'[INFO] loading model {self.opt.model}...')
         self.processor = AutoProcessor.from_pretrained(opt.model)
         self.model = AutoModelForCTC.from_pretrained(opt.model).to(self.device)
+
+        # prepare to save logits
+        if self.opt.save_logits:
+            self.logits = []
 
         # start gui
         dpg.create_context()
@@ -61,27 +70,31 @@ class ASRGUI:
 
     def test_step(self):
 
+        if self.terminated:
+            return
+
         # get a frame of audio
         frame = self.get_audio_frame()
-
+        
+        # the last frame
         if frame is None:
-            dpg.set_value("_log_text", self.text + '\n[END]')
-            return
-
-        self.frames.append(frame)
-
-        # context not enough, do not run network.
-        if len(self.frames) < self.stride_left_size + self.context_size + self.stride_right_size:
-            return
+            # terminate, but always run the network for the left frames
+            self.terminated = True
+        else:
+            self.frames.append(frame)
+            # context not enough, do not run network.
+            if len(self.frames) < self.stride_left_size + self.context_size + self.stride_right_size:
+                return
         
         inputs = np.concatenate(self.frames) # [N * chunk]
 
         # discard the old part
-        self.frames = self.frames[-(self.stride_left_size + self.stride_right_size):]
+        if not self.terminated:
+            self.frames = self.frames[-(self.stride_left_size + self.stride_right_size):]
 
         t0 = time.time()
 
-        text = self.frame_to_text(inputs)
+        logits, text = self.frame_to_text(inputs)
 
         # very naive, just concat the text output.
         if text != '':
@@ -91,6 +104,29 @@ class ASRGUI:
             torch.cuda.synchronize()
 
         t = time.time() - t0
+
+        # save logits
+        if self.opt.save_logits:
+            self.logits.append(logits)
+
+        # will only run once at ternimation
+        if self.terminated:
+            self.text += '\n[END]'
+            if self.opt.save_logits:
+                print(f'[INFO] save logits... ')
+                logits = torch.cat(self.logits, dim=0) # [N, 32]
+                print(logits.shape)
+                # temp: unfold 16x window...
+                K = logits.shape[-1] # n_characters, 32 for wav2vec2
+                window_size = 16
+                padding = window_size // 2
+                logits = logits.view(-1, K).permute(1, 0).contiguous() # [K, M]
+                logits = logits.view(1, K, -1, 1) # [1, K, M, 1]
+                unfold_logits = F.unfold(logits, kernel_size=(window_size, 1), padding=(padding, 0), stride=(2, 1)) # [1, K * window_size, M / 2 + 1]
+                unfold_logits = unfold_logits.view(K, window_size, -1).permute(2, 1, 0).contiguous() # [M / 2 + 1, window_size, K]
+                print(unfold_logits.shape)
+                np.save(self.opt.wav.replace('.wav', '.npy'), unfold_logits.cpu().numpy())
+                print(f"[INFO] saved logits to {self.opt.wav.replace('.wav', '.npy')}")
 
         dpg.set_value("_log_text", self.text)
         dpg.set_value("_log_infer_time", f'{1000 * t:.4f}ms ({int(1/t)} FPS)')
@@ -167,23 +203,33 @@ class ASRGUI:
     def frame_to_text(self, frame):
         # frame: [N * 320], N = (context_size + 2 * stride_size)
         
-        inputs = self.processor(torch.from_numpy(frame), sampling_rate=self.sample_rate, return_tensors="pt", padding=True)
+        inputs = self.processor(frame, sampling_rate=self.sample_rate, return_tensors="pt", padding=True)
         
         with torch.no_grad():
             result = self.model(inputs.input_values.to(self.device))
             logits = result.logits # [1, N - 1, 32]
         
         # cut off stride
-        left = max(0, self.stride_left_size - 1)
-        right = min(logits.shape[1], logits.shape[1] - self.stride_right_size + 1)
+        left = max(0, self.stride_left_size)
+        right = min(logits.shape[1], logits.shape[1] - self.stride_right_size + 1) # +1 to make sure output is the same length as input.
+
+        # do not cut right if terminated.
+        if self.terminated:
+            right = logits.shape[1]
+
         logits = logits[:, left:right]
+
+        # print(frame.shape, inputs.input_values.shape, logits.shape)
     
         predicted_ids = torch.argmax(logits, dim=-1)
         transcription = self.processor.batch_decode(predicted_ids)[0].lower()
 
+        # labels = np.array([' ', ' ', ' ', '-', '|', 'E', 'T', 'A', 'O', 'N', 'I', 'H', 'S', 'R', 'D', 'L', 'U', 'M', 'W', 'C', 'F', 'G', 'Y', 'P', 'B', 'V', 'K', "'", 'X', 'J', 'Q', 'Z'])
+        # print(''.join(labels[predicted_ids[0].detach().cpu().long().numpy()]))
+        # print(predicted_ids[0])
         # print(transcription)
 
-        return transcription
+        return logits[0], transcription
 
         
     def register_dpg(self):
@@ -228,6 +274,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--wav', type=str, default='')
     parser.add_argument('--model', type=str, default='facebook/wav2vec2-large-960h-lv60-self')
+    parser.add_argument('--save_logits', action='store_true')
     # audio FPS
     parser.add_argument('--fps', type=int, default=50)
     # sliding window left-middle-right length.
