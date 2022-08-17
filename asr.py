@@ -9,14 +9,42 @@ import resampy
 
 import dearpygui.dearpygui as dpg
 
+import pyaudio
+
+# import multiprocessing as mp
 # from multiprocessing import Queue, Process, Event
 from queue import Queue
 from threading import Thread, Event
+
+def _read_frame(stream, exit_event, queue, chunk):
+
+    while True:
+
+        if exit_event.is_set():
+            break
+        frame = stream.read(chunk, exception_on_overflow=False)
+        frame = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32767 # [chunk]
+        queue.put(frame)
+
+        # print(f'[INFO] read frame {frame.shape}')
+
+def _play_frame(stream, exit_event, queue, chunk):
+
+    while True:
+        if exit_event.is_set():
+            break
+        frame = queue.get()
+        print(f'[INFO] write frame {len(frame)}')
+        frame = (frame * 32767).astype(np.int16).tobytes()
+        stream.write(frame, chunk)
+
+
 
 class ASRGUI:
     def __init__(self, opt):
 
         self.opt = opt
+        self.play = opt.play
 
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.fps = opt.fps # 20 ms per frame
@@ -38,38 +66,31 @@ class ASRGUI:
             self.frames.extend([np.zeros(self.chunk, dtype=np.float32)] * self.stride_left_size)
 
         # create input stream
+        self.exit_event = Event()
+
+        self.audio_instance = pyaudio.PyAudio()
+
         if self.mode == 'file':
-            self.stream = self.create_file_stream()
+            self.file_stream = self.create_file_stream()
         else:
             # start a background process to read frames
+            self.input_stream = self.audio_instance.open(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=True, output=False, frames_per_buffer=self.chunk)
             self.queue = Queue()
-            self.exit_event = Event()
-
-            def _read_frame():
-                audio_instance, stream = self.create_pyaudio_stream()
-
-                while True:
-                    if self.exit_event.is_set():
-                        break
-                    frame = stream.read(self.chunk, exception_on_overflow=False)
-                    frame = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32767 # [chunk]
-                    # print(f'[INFO] read frame {frame.shape}')
-                    self.queue.put(frame)
-
-                stream.stop_stream()
-                stream.close()
-                audio_instance.terminate()
-            
-            # self.process_read_frame = Process(target=_read_frame)
-            self.process_read_frame = Thread(target=_read_frame)
+            self.process_read_frame = Thread(target=_read_frame, args=(self.input_stream, self.exit_event, self.queue, self.chunk))
+        
+        # play out the audio too...?
+        if self.play:
+            self.output_stream = self.audio_instance.open(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=False, output=True, frames_per_buffer=self.chunk)
+            self.output_queue = Queue()
+            self.process_play_frame = Thread(target=_play_frame, args=(self.output_stream, self.exit_event, self.output_queue, self.chunk))
 
         # current location of audio
         self.idx = 0
 
         # create wav2vec model
         print(f'[INFO] loading model {self.opt.model}...')
-        self.processor = AutoProcessor.from_pretrained(opt.model)
-        self.model = AutoModelForCTC.from_pretrained(opt.model).to(self.device)
+        self.processor = AutoProcessor.from_pretrained(self.opt.model)
+        self.model = AutoModelForCTC.from_pretrained(self.opt.model).to(self.device)
 
         # prepare to save logits
         if self.opt.save_logits:
@@ -79,20 +100,34 @@ class ASRGUI:
         dpg.create_context()
         self.register_dpg()
 
-        print(f'[INFO] starting read frame thread...')
-        self.process_read_frame.start()
+        if self.mode == 'live':
+            print(f'[INFO] starting read frame thread...')
+            self.process_read_frame.start()
         
-        self.test_step()
+        if self.play:
+            print(f'[INFO] starting play frame thread...')
+            self.process_play_frame.start()
+
+        print(f'[INFO] initialized!')
         
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         
+        self.exit_event.set()
+
+        if self.play:
+            self.process_play_frame.join()
+            self.output_stream.stop_stream()
+            self.output_stream.close()
+
         if self.mode == 'live':
-            
-            self.exit_event.set()
             self.process_read_frame.join()
+            self.input_stream.stop_stream()
+            self.input_stream.close()
+
+        self.audio_instance.terminate()
 
         dpg.destroy_context()
 
@@ -111,6 +146,11 @@ class ASRGUI:
             self.terminated = True
         else:
             self.frames.append(frame)
+
+            # re-play the frame immediately ?
+            if self.play:
+                self.output_queue.put(frame)
+
             # context not enough, do not run network.
             if len(self.frames) < self.stride_left_size + self.context_size + self.stride_right_size:
                 return
@@ -163,7 +203,7 @@ class ASRGUI:
     
     def create_file_stream(self):
     
-        stream, sample_rate = sf.read(opt.wav) # [T*sample_rate,] float64
+        stream, sample_rate = sf.read(self.opt.wav) # [T*sample_rate,] float64
         stream = stream.astype(np.float32)
 
         if stream.ndim > 1:
@@ -174,46 +214,17 @@ class ASRGUI:
             print(f'[WARN] audio sample rate is {sample_rate}, resampling into {self.sample_rate}.')
             stream = resampy.resample(x=stream, sr_orig=sample_rate, sr_new=self.sample_rate)
 
-        print(f'[INFO] loaded audio stream {opt.wav}: {stream.shape}')
+        print(f'[INFO] loaded audio stream {self.opt.wav}: {stream.shape}')
 
         return stream
-
-
-    def create_pyaudio_stream(self):
-
-        import pyaudio
-
-        print(f'[INFO] creating live audio stream ...')
-
-        audio = pyaudio.PyAudio()
-        
-        # get devices
-        info = audio.get_host_api_info_by_index(0)
-        n_devices = info.get('deviceCount')
-
-        for i in range(0, n_devices):
-            if (audio.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
-                name = audio.get_device_info_by_host_api_device_index(0, i).get('name')
-                print(f'[INFO] choose audio device {name}, id {i}')
-                break
-        
-        # get stream
-        stream = audio.open(input_device_index=i,
-                            format=pyaudio.paInt16,
-                            channels=1,
-                            rate=self.sample_rate,
-                            input=True,
-                            frames_per_buffer=self.chunk)
-
-        return audio, stream
 
     
     def get_audio_frame(self):
 
         if self.mode == 'file':
         
-            if self.idx < self.stream.shape[0]:
-                frame = self.stream[self.idx: self.idx + self.chunk]
+            if self.idx < self.file_stream.shape[0]:
+                frame = self.file_stream[self.idx: self.idx + self.chunk]
                 self.idx = self.idx + self.chunk
                 return frame
             else:
@@ -223,6 +234,8 @@ class ASRGUI:
 
             # get from multiprocessing queue.
             frame = self.queue.get()
+
+            # print(f'[INFO] get frame {frame.shape}')
 
             self.idx = self.idx + self.chunk
 
@@ -285,6 +298,9 @@ class ASRGUI:
             
             dpg.add_text("", tag="_log_text", wrap=0)
 
+        # show metrics
+        dpg.show_tool(dpg.mvTool_Metrics)
+
         dpg.set_primary_window("_primary_window", True)
         dpg.show_viewport()
 
@@ -298,11 +314,14 @@ class ASRGUI:
 
 
 if __name__ == '__main__':
+    # mp.set_start_method('spawn')
+
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--wav', type=str, default='')
     parser.add_argument('--model', type=str, default='facebook/wav2vec2-large-960h-lv60-self')
+    parser.add_argument('--play', action='store_true')
     parser.add_argument('--save_logits', action='store_true')
     # audio FPS
     parser.add_argument('--fps', type=int, default=50)
