@@ -9,7 +9,9 @@ import resampy
 
 import dearpygui.dearpygui as dpg
 
-from multiprocessing import Queue, Process, Event
+# from multiprocessing import Queue, Process, Event
+from queue import Queue
+from threading import Thread, Event
 
 class ASRGUI:
     def __init__(self, opt):
@@ -58,7 +60,8 @@ class ASRGUI:
                 stream.close()
                 audio_instance.terminate()
             
-            self.process_read_frame = Process(target=_read_frame)
+            # self.process_read_frame = Process(target=_read_frame)
+            self.process_read_frame = Thread(target=_read_frame)
 
         # current location of audio
         self.idx = 0
