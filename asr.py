@@ -34,7 +34,7 @@ def _play_frame(stream, exit_event, queue, chunk):
         if exit_event.is_set():
             break
         frame = queue.get()
-        print(f'[INFO] write frame {len(frame)}')
+        # print(f'[INFO] write frame {len(frame)}')
         frame = (frame * 32767).astype(np.int16).tobytes()
         stream.write(frame, chunk)
 
