@@ -9,6 +9,8 @@ import resampy
 
 import dearpygui.dearpygui as dpg
 
+from multiprocessing import Queue, Process, Event
+
 class ASRGUI:
     def __init__(self, opt):
 
@@ -37,7 +39,26 @@ class ASRGUI:
         if self.mode == 'file':
             self.stream = self.create_file_stream()
         else:
-            self.audio_instance, self.stream = self.create_pyaudio_stream()
+            # start a background process to read frames
+            self.queue = Queue()
+            self.exit_event = Event()
+
+            def _read_frame():
+                audio_instance, stream = self.create_pyaudio_stream()
+
+                while True:
+                    if self.exit_event.is_set():
+                        break
+                    frame = stream.read(self.chunk, exception_on_overflow=False)
+                    frame = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32767 # [chunk]
+                    # print(f'[INFO] read frame {frame.shape}')
+                    self.queue.put(frame)
+
+                stream.stop_stream()
+                stream.close()
+                audio_instance.terminate()
+            
+            self.process_read_frame = Process(target=_read_frame)
 
         # current location of audio
         self.idx = 0
@@ -54,6 +75,10 @@ class ASRGUI:
         # start gui
         dpg.create_context()
         self.register_dpg()
+
+        print(f'[INFO] starting read frame thread...')
+        self.process_read_frame.start()
+        
         self.test_step()
         
     def __enter__(self):
@@ -62,9 +87,10 @@ class ASRGUI:
     def __exit__(self, exc_type, exc_value, traceback):
         
         if self.mode == 'live':
-            self.stream.stop_stream()
-            self.stream.close()
-            self.audio_instance.terminate()
+            
+            self.exit_event.set()
+            self.process_read_frame.join()
+
         dpg.destroy_context()
 
 
@@ -126,7 +152,7 @@ class ASRGUI:
                 unfold_logits = unfold_logits.view(K, window_size, -1).permute(2, 1, 0).contiguous() # [M / 2 + 1, window_size, K]
                 print(unfold_logits.shape)
                 np.save(self.opt.wav.replace('.wav', '.npy'), unfold_logits.cpu().numpy())
-                print(f"[INFO] saved logits to {self.opt.wav.replace('.wav', '.npy')}")
+                print(f"[INFO] saved logits to {self.opt.wav.replace('.wav', '_wv.npy')}")
 
         dpg.set_value("_log_text", self.text)
         dpg.set_value("_log_infer_time", f'{1000 * t:.4f}ms ({int(1/t)} FPS)')
@@ -175,7 +201,7 @@ class ASRGUI:
                             rate=self.sample_rate,
                             input=True,
                             frames_per_buffer=self.chunk)
-        
+
         return audio, stream
 
     
@@ -192,8 +218,8 @@ class ASRGUI:
         
         else:
 
-            frame = self.stream.read(self.chunk, exception_on_overflow=False)
-            frame = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32767 # [chunk]
+            # get from multiprocessing queue.
+            frame = self.queue.get()
 
             self.idx = self.idx + self.chunk
 
